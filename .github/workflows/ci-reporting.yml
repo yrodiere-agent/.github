@@ -83,22 +83,14 @@ jobs:
     name: Publish Develocity build scans
     needs: setup
     if: needs.setup.outputs.build-scans == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       actions: read
-      contents: read
     outputs:
       published: ${{ steps.publish-gradle.outputs.published || steps.publish-maven.outputs.published || '0' }}
       failed: ${{ steps.publish-gradle.outputs.failed || steps.publish-maven.outputs.failed || '0' }}
       scan-report: ${{ steps.publish-gradle.outputs.scan-report || steps.publish-maven.outputs.scan-report }}
     steps:
-      - name: Check out target branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          repository: ${{ github.event.workflow_run.repository.full_name }}
-          ref: ${{ needs.setup.outputs.target-branch }}
-
       - name: Set up Java
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
@@ -156,10 +148,20 @@ jobs:
         if: steps.download.outcome == 'success' && needs.setup.outputs.build-system == 'gradle'
         env:
           DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY_PR }}
-          COMMON_GRADLE_ARGS: ${{ needs.setup.outputs.gradle-args }}
         run: |
+          GRADLE_VERSION="8.14.2"
+          GRADLE_HASH="7197a12f450794931532469d4ff21a59ea2c1cd59a3ec3f89c035c3c420a6999"
+          curl --create-dirs --fail -sSLo "$HOME/.gradle-dist/gradle.zip" \
+            "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip"
+          DOWNLOADED_HASH=$(sha256sum "$HOME/.gradle-dist/gradle.zip" | awk '{print $1}')
+          if [ "$DOWNLOADED_HASH" != "$GRADLE_HASH" ]; then
+            echo "::error::Gradle distribution checksum mismatch. Expected: $GRADLE_HASH, got: $DOWNLOADED_HASH"
+            exit 1
+          fi
+          unzip -q -o "$HOME/.gradle-dist/gradle.zip" -d "$HOME/.gradle-dist/"
+          GRADLE="$HOME/.gradle-dist/gradle-$GRADLE_VERSION/bin/gradle"
+
           shopt -s nullglob
-          read -ra gradle_args <<< "$COMMON_GRADLE_ARGS"
           published=0
           failed=0
           scan_report=""
@@ -167,9 +169,54 @@ jobs:
           for build_scan_data_directory in /tmp/downloaded-build-scan-data/*
           do
             rm -rf ~/.gradle/build-scan-data
-            mv "$build_scan_data_directory" ~/.gradle/build-scan-data
             job_name=$(basename "$build_scan_data_directory")
-            if output=$(./gradlew "${gradle_args[@]}" --no-build-cache buildScanPublishPrevious 2>&1); then
+            if ! mv "$build_scan_data_directory" ~/.gradle/build-scan-data; then
+              echo "::warning::Failed to move build scan data from $job_name"
+              failed=$((failed + 1))
+              continue
+            fi
+
+            # Detect the Develocity plugin version from the build scan data directory structure
+            version_dirs=()
+            for d in ~/.gradle/build-scan-data/*/; do
+              version_dirs+=("$(basename "$d")")
+            done
+            if [ ${#version_dirs[@]} -ne 1 ]; then
+              echo "::warning::Expected exactly one version directory in build scan data of $job_name, found ${#version_dirs[@]}; skipping"
+              failed=$((failed + 1))
+              continue
+            fi
+            plugin_version="${version_dirs[0]}"
+            if ! [[ "$plugin_version" =~ ^[0-9][0-9A-Za-z.\-]*$ ]]; then
+              echo "::warning::Invalid Develocity plugin version format in build scan data of $job_name; skipping"
+              failed=$((failed + 1))
+              continue
+            fi
+
+            # Select plugin ID based on version: com.gradle.develocity (>= 3.17) vs com.gradle.enterprise (< 3.17)
+            IFS='.' read -r v_major v_minor _ <<< "$plugin_version"
+            if [ "$v_major" -gt 3 ] || { [ "$v_major" -eq 3 ] && [ "$v_minor" -ge 17 ]; }; then
+              plugin_id="com.gradle.develocity"
+              config_block="develocity"
+            else
+              plugin_id="com.gradle.enterprise"
+              config_block="gradleEnterprise"
+            fi
+
+            # Generate the fake project inline
+            project_dir=$(mktemp -d)
+            cat > "$project_dir/settings.gradle" <<SETTINGS
+          plugins {
+              id "${plugin_id}" version "${plugin_version}"
+          }
+          ${config_block} {
+              server = "https://develocity.commonhaus.dev"
+          }
+          rootProject.name = "build-scan-publisher"
+          SETTINGS
+            touch "$project_dir/build.gradle"
+
+            if output=$("$GRADLE" -p "$project_dir" --no-build-cache buildScanPublishPrevious 2>&1); then
               echo "$output"
               published=$((published + 1))
               url=$(echo "$output" | grep -A1 -i 'Publishing build scan' | grep -oE 'https://[^ ]+/s/[a-z0-9]+' | head -1)
@@ -183,6 +230,7 @@ jobs:
               echo "::warning::Failed to publish build scan from $job_name"
               failed=$((failed + 1))
             fi
+            rm -rf "$project_dir"
           done
           echo "::notice::Published $published build scan(s), $failed failed"
           {
@@ -201,10 +249,20 @@ jobs:
         if: steps.download.outcome == 'success' && needs.setup.outputs.build-system == 'maven'
         env:
           DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY_PR }}
-          MAVEN_ARGS: ${{ needs.setup.outputs.maven-args }}
         run: |
+          MAVEN_VERSION="3.9.9"
+          MAVEN_HASH="4ec3f26fb1a692473aea0235c300bd20f0f9fe741947c82c1234cefd76ac3a3c"
+          curl --create-dirs --fail -sSLo "$HOME/.maven-dist/maven.zip" \
+            "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/$MAVEN_VERSION/apache-maven-$MAVEN_VERSION-bin.zip"
+          DOWNLOADED_HASH=$(sha256sum "$HOME/.maven-dist/maven.zip" | awk '{print $1}')
+          if [ "$DOWNLOADED_HASH" != "$MAVEN_HASH" ]; then
+            echo "::error::Maven distribution checksum mismatch. Expected: $MAVEN_HASH, got: $DOWNLOADED_HASH"
+            exit 1
+          fi
+          unzip -q -o "$HOME/.maven-dist/maven.zip" -d "$HOME/.maven-dist/"
+          MVN="$HOME/.maven-dist/apache-maven-$MAVEN_VERSION/bin/mvn"
+
           shopt -s nullglob
-          read -ra mvn_args <<< "$MAVEN_ARGS"
           published=0
           failed=0
           scan_report=""
@@ -218,7 +276,76 @@ jobs:
               failed=$((failed + 1))
               continue
             fi
-            if output=$(./mvnw "${mvn_args[@]}" develocity:build-scan-publish-previous 2>&1); then
+
+            # Detect the Develocity extension version from the build scan data directory structure
+            version_dirs=()
+            for d in ~/.m2/.develocity/build-scan-data/*/; do
+              version_dirs+=("$(basename "$d")")
+            done
+            if [ ${#version_dirs[@]} -ne 1 ]; then
+              echo "::warning::Expected exactly one version directory in build scan data of $job_name, found ${#version_dirs[@]}; skipping"
+              failed=$((failed + 1))
+              continue
+            fi
+            extension_version="${version_dirs[0]}"
+            if ! [[ "$extension_version" =~ ^[0-9][0-9A-Za-z.\-]*$ ]]; then
+              echo "::warning::Invalid Develocity extension version format in build scan data of $job_name; skipping"
+              failed=$((failed + 1))
+              continue
+            fi
+
+            # Select artifact ID and config based on version:
+            # develocity-maven-extension (>= 1.21) vs gradle-enterprise-maven-extension (< 1.21)
+            IFS='.' read -r v_major v_minor _ <<< "$extension_version"
+            if [ "$v_major" -gt 1 ] || { [ "$v_major" -eq 1 ] && [ "$v_minor" -ge 21 ]; }; then
+              artifact_id="develocity-maven-extension"
+              config_root="develocity"
+              config_xmlns="https://www.gradle.com/develocity-maven"
+              config_schema="https://www.gradle.com/schema/develocity-maven.xsd"
+              config_file="develocity.xml"
+            else
+              artifact_id="gradle-enterprise-maven-extension"
+              config_root="gradleEnterprise"
+              config_xmlns="https://www.gradle.com/gradle-enterprise-maven"
+              config_schema="https://www.gradle.com/schema/gradle-enterprise-maven.xsd"
+              config_file="gradle-enterprise.xml"
+            fi
+
+            # Generate the fake project inline
+            project_dir=$(mktemp -d)
+            mkdir -p "$project_dir/.mvn"
+            cat > "$project_dir/.mvn/extensions.xml" <<EXTENSIONS
+          <extensions>
+              <extension>
+                  <groupId>com.gradle</groupId>
+                  <artifactId>${artifact_id}</artifactId>
+                  <version>${extension_version}</version>
+              </extension>
+          </extensions>
+          EXTENSIONS
+            cat > "$project_dir/.mvn/$config_file" <<CONFIG
+          <${config_root}
+                  xmlns="${config_xmlns}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xsi:schemaLocation="${config_xmlns} ${config_schema}">
+              <server>
+                  <url>https://develocity.commonhaus.dev</url>
+              </server>
+          </${config_root}>
+          CONFIG
+            cat > "$project_dir/pom.xml" <<POM
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>org.hibernate.build</groupId>
+              <artifactId>build-scan-publisher</artifactId>
+              <version>1.0.0</version>
+              <packaging>pom</packaging>
+          </project>
+          POM
+
+            if output=$("$MVN" -f "$project_dir/pom.xml" develocity:build-scan-publish-previous 2>&1); then
               echo "$output"
               published=$((published + 1))
               url=$(echo "$output" | grep -A1 -i 'Publishing build scan' | grep -oE 'https://[^ ]+/s/[a-z0-9]+' | head -1)
@@ -232,6 +359,7 @@ jobs:
               echo "::warning::Failed to publish build scan from $job_name"
               failed=$((failed + 1))
             fi
+            rm -rf "$project_dir"
           done
           echo "::notice::Published $published build scan(s), $failed failed"
           {
